@@ -87,7 +87,7 @@ ForgetMeAI: https://t.me/forgetmeai
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/qingshanjiluo/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth
 npm start
