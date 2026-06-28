@@ -54,6 +54,57 @@ async function askYesNo(msg, defNo=true) {
 function readJson(file) { try { return JSON.parse(fs.readFileSync(path.join(ROOT,file),'utf8')); } catch { return null; } }
 async function pause() { await ask(t('pressEnter')); }
 
+// ---- multi-account helpers ----
+function getAccountsDir() {
+  const env = process.env.DEEPSEEK_AUTH_DIR || path.join(ROOT, 'accounts');
+  return env;
+}
+function scanAccounts() {
+  const result = [];
+  const single = readJson('deepseek-auth.json');
+  if (single) {
+    if (Array.isArray(single)) result.push(...single.map((a,i) => ({...a, _file:'deepseek-auth.json', _idx:i})));
+    else result.push({...single, _file:'deepseek-auth.json', _idx:0});
+  }
+  const dir = getAccountsDir();
+  if (Array.isArray(single)) {
+    // Already array in single file, that's the main mode
+  } else if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    const files = fs.readdirSync(dir).filter(f=>f.endsWith('.json')).sort();
+    for (const f of files) {
+      const fullPath = path.join(dir, f);
+      const a = readJson(path.relative(ROOT, fullPath));
+      if (a && a.token) result.push({...a, _file:path.relative(ROOT, fullPath), _idx:-1});
+    }
+  }
+  return result;
+}
+function accountDisplayName(acc, idx) {
+  const name = acc._file ? path.basename(acc._file) : `account_${idx+1}`;
+  const status = acc.token && acc.cookie ? 'OK' : 'INCOMPLETE';
+  return `${name} | token:${status}`;
+}
+function isSingleFileMode() { return !process.env.DEEPSEEK_AUTH_DIR && Array.isArray(readJson('deepseek-auth.json')); }
+function saveSingleFile(accounts) {
+  const arr = accounts.map(a => { const {_file,_idx,...rest}=a; return rest; });
+  fs.writeFileSync(path.join(ROOT,'deepseek-auth.json'), JSON.stringify(arr.length===1?arr[0]:arr,null,2));
+}
+function saveDirMode(accounts) {
+  const dir = getAccountsDir();
+  if (!fs.existsSync(dir)) { fs.mkdirSync(dir,{recursive:true}); ok(t('multiAccountDirCreated')); }
+  // Clear old files
+  if (fs.existsSync(dir)) {
+    for (const f of fs.readdirSync(dir)) { if (f.endsWith('.json')) fs.unlinkSync(path.join(dir,f)); }
+  }
+  for (let i=0;i<accounts.length;i++) {
+    const {_file,_idx,...rest}=accounts[i];
+    fs.writeFileSync(path.join(dir,`account_${String(i+1).padStart(2,'0')}.json`), JSON.stringify(rest,null,2));
+  }
+  // Point env to directory
+  process.env.DEEPSEEK_AUTH_DIR = dir;
+  if (fs.existsSync(path.join(ROOT,'deepseek-auth.json'))) fs.unlinkSync(path.join(ROOT,'deepseek-auth.json'));
+}
+
 const CONFIG_FILE = path.join(ROOT, '.wizard-lang.json');
 function loadSavedLang() { try { const c=JSON.parse(fs.readFileSync(CONFIG_FILE,'utf8')); if (LANGS[c.lang]) return c.lang; } catch {} return null; }
 function saveLang(lang) { fs.mkdirSync(path.dirname(CONFIG_FILE),{recursive:true}); fs.writeFileSync(CONFIG_FILE,JSON.stringify({lang}),'utf8'); }
@@ -99,31 +150,104 @@ async function main() {
     ok(t('depsInstalling'));
   } else { ok(t('depsOk')); }
 
-  // ---- auth ----
+  // ---- auth / multi-account ----
   step('2/5', t('stepAuth'));
   divider();
+
+  let accounts = scanAccounts();
+  let accountsDirty = false;
+
+  async function showAccountMenu() {
+    while (true) {
+      accounts = scanAccounts();
+      const count = accounts.length;
+      console.log();
+      if (count > 0) {
+        ok(t('multiAccountCount',{count}));
+        console.log(`  ${C.dim}${t('multiAccountList')}${C.reset}`);
+        for (let i=0;i<count;i++) {
+          const s = accounts[i].token&&accounts[i].cookie ? C.green+'OK'+C.reset : C.yellow+'MISSING'+C.reset;
+          console.log(`    ${i+1}. ${accountDisplayName(accounts[i],i)} [${s}]`);
+        }
+      } else {
+        warn(t('authMissing'));
+      }
+
+      const mode = Array.isArray(readJson('deepseek-auth.json')) ? t('multiAccountModeSingle') : t('multiAccountModeSingle');
+      info(t('multiAccountMode',{mode}));
+
+      const opts = [t('multiAccountAddLogin'), t('multiAccountAddImport'), t('multiAccountAddManual')];
+      if (count > 0) opts.push(t('multiAccountRemove'));
+      opts.push(t('pressEnter') + ' \u2192 ' + t('stepSummary'));
+
+      const m = await askChoice(t('multiAccountTitle'), opts);
+      if (m === 1) {
+        console.log(`\n  ${C.yellow}${t('chromeLaunching')}${C.reset}`);
+        console.log(`  ${C.dim}${t('chromeStep1')}${C.reset}`);
+        console.log(`  ${C.dim}${t('chromeStep2')}${C.reset}`);
+        console.log(`  ${C.dim}${t('chromeStep3')}${C.reset}`);
+        await pause();
+        spawnSync('node',[path.join(__dirname,'deepseek_chrome_auth.js')],{cwd:ROOT,stdio:'inherit',env:process.env});
+        accountsDirty = true;
+      } else if (m === 2) {
+        spawnSync('node',[path.join(__dirname,'auth_import.js')],{cwd:ROOT,stdio:'inherit',env:process.env});
+        accountsDirty = true;
+      } else if (m === 3) {
+        const tok = await ask(t('multiAccountManualToken'));
+        const ck = await ask(t('multiAccountManualCookie'));
+        if (tok && ck) {
+          const existing = scanAccounts();
+          const newAcc = { token: tok, cookie: ck, hif_dliq: '', hif_leim: '', wasmUrl: 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm' };
+          existing.push(newAcc);
+          if (existing.length === 1) {
+            saveSingleFile(existing);
+            ok(t('multiAccountManualSaved',{file:'deepseek-auth.json'}));
+          } else {
+            // If >= 2, ask if user wants directory mode
+            const useDir = await askYesNo(t('multiAccountSwitchMode'));
+            if (useDir) {
+              saveDirMode(existing);
+              ok('accounts/ directory mode active');
+            } else {
+              saveSingleFile(existing);
+              ok(t('multiAccountManualSaved',{file:'deepseek-auth.json'}));
+            }
+          }
+          accountsDirty = true;
+        }
+      } else if (m === 4 && count > 0) {
+        const rmIdx = parseInt(await ask(t('multiAccountRemovePrompt'),'0'),10);
+        if (rmIdx >= 1 && rmIdx <= count) {
+          const existing = scanAccounts();
+          existing.splice(rmIdx-1,1);
+          if (existing.length === 0) {
+            if (fs.existsSync(path.join(ROOT,'deepseek-auth.json'))) fs.unlinkSync(path.join(ROOT,'deepseek-auth.json'));
+          } else {
+            const dir = getAccountsDir();
+            if (fs.existsSync(dir) && fs.readdirSync(dir).some(f=>f.endsWith('.json'))) {
+              saveDirMode(existing);
+            } else {
+              saveSingleFile(existing);
+            }
+          }
+          ok(t('multiAccountRemoveDone',{id:'#'+rmIdx}));
+          accountsDirty = true;
+        }
+      } else {
+        break; // done
+      }
+    }
+  }
+
+  await showAccountMenu();
+
+  // reload after multi-account config
   let auth = readJson('deepseek-auth.json');
-  if (auth && auth.token && auth.cookie) {
-    ok(t('authOk'));
-    info(t('authTokenCookie',{tokenLen:auth.token.length,cookieLen:auth.cookie.split(';').length}));
-    if (!(await askYesNo(t('authReconfig')))) { ok(t('authKeptAsIs')); } else { auth=null; }
-  } else if (auth) { warn(t('authFileBroken')); auth=null; } else { warn(t('authMissing')); }
+  if (!auth || !auth.token) auth = null;
+  // also check directory mode
   if (!auth) {
-    const m = await askChoice(t('authMethodTitle'), [t('authMethod1'),t('authMethod2'),t('authMethod3')]);
-    if (m===1) {
-      console.log(`\n  ${C.yellow}${t('chromeLaunching')}${C.reset}`);
-      console.log(`  ${C.dim}${t('chromeStep1')}${C.reset}`);
-      console.log(`  ${C.dim}${t('chromeStep2')}${C.reset}`);
-      console.log(`  ${C.dim}${t('chromeStep3')}${C.reset}`);
-      await pause();
-      spawnSync('node',[path.join(__dirname,'deepseek_chrome_auth.js')],{cwd:ROOT,stdio:'inherit',env:process.env});
-      auth=readJson('deepseek-auth.json');
-      auth&&auth.token&&auth.cookie ? ok(t('authConfigured')) : warn(t('authIncomplete'));
-    } else if (m===2) {
-      spawnSync('node',[path.join(__dirname,'auth_import.js')],{cwd:ROOT,stdio:'inherit',env:process.env});
-      auth=readJson('deepseek-auth.json');
-      auth&&auth.token&&auth.cookie ? ok(t('authImported')) : warn(t('importIncomplete'));
-    } else { warn(t('authSkipped')); }
+    const accts = scanAccounts();
+    if (accts.length > 0 && accts[0].token && accts[0].cookie) auth = accts[0];
   }
 
   // ---- connection ----
