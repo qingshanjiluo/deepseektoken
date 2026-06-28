@@ -257,12 +257,14 @@ async function main() {
 
   // ============== SECTION: PROXY AUTH ==============
   if(runProxy){
-    const proxyLabel = (paena,keys,bears) => paena ? C.green + wt('welcomeCardProxyOn', {keys,bears}) + C.reset : C.yellow + wt('welcomeCardProxyOff') + C.reset;
-    try{pa=require(paFile);}catch{pa=null;}
+    function readProxyAuth() { try { return JSON.parse(fs.readFileSync(paFile, 'utf8')); } catch { return null; } }
+    const proxyLabel = (paena,keys,bearers) => paena ? C.green + wt('welcomeCardProxyOn', {keys,bearers}) + C.reset : C.yellow + wt('welcomeCardProxyOff') + C.reset;
+    pa = readProxyAuth();
     const initialEnabled = pa && pa.enabled;
 
     while(true){
-      try{pa=require(paFile);}catch{pa=null;}
+      delete require.cache[require.resolve(paFile)];
+      pa = readProxyAuth();
       const paEnabled = pa && pa.enabled;
       const paKeys = (pa && pa.apiKeys) || [];
       const paTokens = (pa && pa.bearerTokens) || [];
@@ -299,7 +301,8 @@ async function main() {
         if(!initialEnabled){
           const enableChoice=await askChoice('',[wt('proxyEnableTitle'),wt('proxyAddKey')+' + '+wt('proxyAddToken'),wt('sectionSkip')]);
           if(enableChoice===1){
-            try{pa=require(paFile);}catch{pa=null;}
+            delete require.cache[require.resolve(paFile)];
+            pa = readProxyAuth();
             const exKeys=(pa&&pa.apiKeys)||[];const exTokens=(pa&&pa.bearerTokens)||[];
             if(exKeys.length>0||exTokens.length>0){
               if(await askYesNo('',false)){
@@ -329,7 +332,8 @@ async function main() {
           }else{break;}
         }else{
           // Was enabled, user disabled it - offer to re-enable or keep off
-          try{pa=require(paFile);}catch{pa=null;}
+          delete require.cache[require.resolve(paFile)];
+          pa = readProxyAuth();
           const exKeys=(pa&&pa.apiKeys)||[];const exTokens=(pa&&pa.bearerTokens)||[];
           const reenableChoice=await askChoice('',[wt('proxyEnableTitle'),wt('proxyKeepDisabled')]);
           if(reenableChoice===1){
