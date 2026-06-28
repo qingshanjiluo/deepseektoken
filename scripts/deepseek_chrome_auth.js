@@ -76,19 +76,26 @@ function removeProfileSafely(dir) {
             if (!fs.existsSync(dir)) return;
         } catch (e) {
             if (i === 4) {
-                const staleDir = `${dir}.stale-${Date.now()}`;
-                fs.renameSync(dir, staleDir);
+                let staleDir = `${dir}.stale-${Date.now()}`;
                 try {
-                    fs.rmSync(staleDir, {
-                        recursive: true,
-                        force: true,
-                        maxRetries: 3,
-                        retryDelay: 250,
-                    });
-                } catch {}
-                console.log(
-                    `[auth] Old profile was busy; moved it aside: ${staleDir}`,
-                );
+                    fs.renameSync(dir, staleDir);
+                } catch (e2) {
+                    console.log('[auth] Could not rename busy profile, will overwrite contents');
+                    staleDir = null;
+                }
+                if (staleDir) {
+                    try {
+                        fs.rmSync(staleDir, {
+                            recursive: true,
+                            force: true,
+                            maxRetries: 3,
+                            retryDelay: 250,
+                        });
+                    } catch {}
+                    console.log(
+                        `[auth] Old profile was busy; moved it aside: ${staleDir}`,
+                    );
+                }
                 return;
             }
         }
@@ -469,8 +476,19 @@ async function main() {
         await sleep(500);
     }
     const { href, cookiesCount, ...persisted } = auth;
-    fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
-    console.log(`[auth] 已保存: ${outPath}`);
+    // If auth file already exists, append as multi-account array instead of overwriting
+    let existing = null;
+    try { existing = JSON.parse(fs.readFileSync(outPath, 'utf8')); } catch {}
+    if (existing && Array.isArray(existing)) {
+        existing.push(persisted);
+    } else if (existing && existing.token) {
+        existing = [existing, persisted];
+    } else {
+        existing = persisted;
+    }
+    fs.writeFileSync(outPath, JSON.stringify(existing, null, 2));
+    const isMulti = Array.isArray(existing);
+    console.log(`[auth] 已保存: ${outPath}${isMulti ? ' (' + existing.length + ' 个账号)' : ''}`);
     console.log(`[auth] 页面: ${href || 'unknown'}`);
     console.log(
         `[auth] token: ${persisted.token ? 'OK (' + persisted.token.length + ' 字符)' : '缺失'}`,
