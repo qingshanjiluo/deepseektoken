@@ -2211,6 +2211,18 @@ async function main() {
         console.log('[DS-API] GET  /v1/sessions — 活跃的代理会话列表');
         console.log('[DS-API] POST /reset-session?agent=<id> — 重置代理会话');
         console.log('[DS-API] POST /reset-session?agent=all — 重置所有会话');
+        console.log('');
+        console.log('===  配置建议 ===');
+        console.log('  模型       : deepseek-chat / deepseek-reasoner / deepseek-expert / deepseek-vision');
+        console.log('  基础 URL   : http://localhost:9655/v1 (OpenAI 兼容)');
+        console.log('  参数示例   : curl -X POST http://localhost:9655/v1/chat/completions \\');
+        console.log('                -H "Content-Type: application/json" \\');
+        console.log('                -H "x-agent-session: my-agent" \\');
+        console.log('                -d \'{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}\'');
+        console.log('  流式       : stream=true 启用流式输出');
+        console.log('  代理鉴权   : x-api-key 或 Authorization: Bearer');
+        console.log('  管理界面   : http://localhost:9655/src/admin/index.html');
+        console.log('');
     });
 }
 
