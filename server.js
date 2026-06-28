@@ -21,6 +21,9 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
+const AuthMiddleware = require('./src/auth/authMiddleware');
+const { ProxyKeyStore } = require('./src/auth/proxyKeyStore');
+const { getProxyDefaults } = require('./src/config/proxy-defaults');
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -38,6 +41,11 @@ const SERVER_PUBLIC_IP = (() => {
 const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
 const HOST = process.env.HOST || '0.0.0.0';
+const proxyDefaults = getProxyDefaults(process.env);
+const DEFAULT_INJECTION_PROMPT = proxyDefaults.defaultInjectionPrompt;
+const BOOTSTRAP_INJECTION_ENABLED = proxyDefaults.bootstrapInjectionEnabled;
+const PROXY_AUTH_PATH = proxyDefaults.proxyAuthPath;
+const PROXY_REQUIRE_AUTH = proxyDefaults.proxyRequireAuth;
 function formatWatermark(prefix = 'ForgetMeAI') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
     console.log(`
@@ -71,6 +79,8 @@ let DS_CONFIG = {};
 let dsHeaders = {};
 const accounts = [];
 let accountRoundRobin = 0;
+const proxyKeyStore = new ProxyKeyStore({ filePath: PROXY_AUTH_PATH });
+proxyKeyStore.load();
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -150,10 +160,7 @@ function selectAccountForSession(session) {
             // A DeepSeek chat_session belongs to the auth account that created it.
             // If that account is rate-limited/expired, do not keep hammering it;
             // reset the web session and let a healthy account take over.
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
+            resetWebSession(session);
         }
         session.accountId = null;
     }
@@ -207,6 +214,7 @@ async function readDeepSeekJsonResponse(resp, label, account) {
     if (!resp.ok) markAccountFailure(account, resp.status, label);
     return { json, text };
 }
+
 if (require.main === module) {
     loadDeepSeekConfig({ fatal: false });
 }
@@ -218,7 +226,88 @@ function createSession() {
         createdAt: null,
         messageCount: 0,
         accountId: null,
+        bootstrapInjected: false,
+        bootstrapInjectedAt: null,
+        lastResponseMessageId: null,
+        lastFinishReason: null,
         history: [],
+    };
+}
+
+function resetWebSession(session) {
+    session.id = null;
+    session.parentMessageId = null;
+    session.createdAt = null;
+    session.messageCount = 0;
+    session.bootstrapInjected = false;
+    session.bootstrapInjectedAt = null;
+    session.lastResponseMessageId = null;
+    session.lastFinishReason = null;
+}
+
+function shouldBootstrapSession(session) {
+    return !!(session && session.id && !session.bootstrapInjected && Number(session.messageCount || 0) === 0);
+}
+
+async function performBootstrapInjection(session, agentId, model, agentTag) {
+    if (!shouldBootstrapSession(session)) return;
+    if (!BOOTSTRAP_INJECTION_ENABLED) return;
+
+    const bootstrapPrompt = DEFAULT_INJECTION_PROMPT;
+    const account = selectAccountForSession(session);
+    const modelCfg = resolveModelConfig(model);
+
+    console.log(`${agentTag} 开始 bootstrap 注入（隐藏预热）`);
+    try {
+        const { resp } = await askDeepSeekStream(bootstrapPrompt, agentId, model, []);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let done = false;
+        let bootstrapMessageId = null;
+
+        while (!done) {
+            const chunk = await reader.read();
+            done = chunk.done;
+            if (chunk.value) {
+                buffer += decoder.decode(chunk.value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const d = JSON.parse(line.slice(6));
+                            if (d.response_message_id !== undefined && !bootstrapMessageId) {
+                                bootstrapMessageId = d.response_message_id;
+                            }
+                            if (d.v && typeof d.v === 'object' && d.v.response && d.v.response.message_id !== undefined) {
+                                bootstrapMessageId = d.v.response.message_id;
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+        }
+
+        if (bootstrapMessageId) {
+            session.parentMessageId = bootstrapMessageId;
+            session.bootstrapInjected = true;
+            session.bootstrapInjectedAt = Date.now();
+            session.messageCount = 0;
+            console.log(`${agentTag} bootstrap 注入完成（message_id: ${bootstrapMessageId}）`);
+        } else {
+            console.log(`${agentTag} bootstrap 未获取到 message_id，跳过`);
+        }
+    } catch (e) {
+        console.log(`${agentTag} bootstrap 注入失败（非致命）: ${e.message}`);
+    }
+}
+
+function buildContinuePayload(chatSessionId, messageId) {
+    return {
+        chat_session_id: chatSessionId,
+        message_id: messageId,
+        fallback_to_resume: true,
     };
 }
 
@@ -250,6 +339,88 @@ async function solvePOW(challenge, config = DS_CONFIG) {
     e.__wbindgen_add_to_stack_pointer(16);
     if (code === 0 || !Number.isFinite(ans) || ans <= 0) throw new Error('POW failed');
     return Math.floor(ans);
+}
+
+async function callDeepSeekContinue(session, account, agentTag) {
+    if (!session.id || !session.lastResponseMessageId) {
+        console.log(`${agentTag} 无法继续：缺少 session.id 或 responseMessageId`);
+        return null;
+    }
+    const dsHeaders = account.headers;
+    const payload = buildContinuePayload(session.id, session.lastResponseMessageId);
+
+    const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+        method: 'POST', headers: dsHeaders,
+        body: JSON.stringify({ target_path: '/api/v0/chat/continue' })
+    });
+    const chalText = await cr.text();
+    if (!cr.ok) {
+        console.log(`${agentTag} continue PoW 挑战失败: HTTP ${cr.status}`);
+        return null;
+    }
+    let chalJson;
+    try { chalJson = JSON.parse(chalText); } catch (e) {
+        console.log(`${agentTag} continue PoW 响应非 JSON`);
+        return null;
+    }
+    const challenge = chalJson?.data?.biz_data?.challenge;
+    if (!challenge) {
+        console.log(`${agentTag} continue PoW 无 challenge`);
+        return null;
+    }
+    const answer = await solvePOW(challenge, account.config);
+    const powB64 = Buffer.from(JSON.stringify({
+        algorithm: challenge.algorithm, challenge: challenge.challenge,
+        salt: challenge.salt, answer: answer,
+        signature: challenge.signature, target_path: '/api/v0/chat/continue'
+    })).toString('base64');
+
+    console.log(`${agentTag} 调用真实 continue（session: ${session.id}, msg: ${session.lastResponseMessageId}）`);
+    const resp = await fetch('https://chat.deepseek.com/api/v0/chat/continue', {
+        method: 'POST',
+        headers: { ...dsHeaders, 'X-DS-PoW-Response': powB64 },
+        body: JSON.stringify(payload),
+    });
+    if (resp.status !== 200) {
+        console.log(`${agentTag} continue 失败: HTTP ${resp.status}`);
+        return null;
+    }
+    return resp;
+}
+
+async function callDeepSeekEditMessage(session, account, prompt, modelCfg) {
+    if (!session.id || !session.lastResponseMessageId) return null;
+    const dsHeaders = account.headers;
+    const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+        method: 'POST', headers: dsHeaders,
+        body: JSON.stringify({ target_path: '/api/v0/chat/edit_message' })
+    });
+    const chalText = await cr.text();
+    if (!cr.ok) return null;
+    let chalJson;
+    try { chalJson = JSON.parse(chalText); } catch (e) { return null; }
+    const challenge = chalJson?.data?.biz_data?.challenge;
+    if (!challenge) return null;
+    const answer = await solvePOW(challenge, account.config);
+    const powB64 = Buffer.from(JSON.stringify({
+        algorithm: challenge.algorithm, challenge: challenge.challenge,
+        salt: challenge.salt, answer, signature: challenge.signature,
+        target_path: '/api/v0/chat/edit_message'
+    })).toString('base64');
+
+    const resp = await fetch('https://chat.deepseek.com/api/v0/chat/edit_message', {
+        method: 'POST',
+        headers: { ...dsHeaders, 'X-DS-PoW-Response': powB64 },
+        body: JSON.stringify({
+            chat_session_id: session.id,
+            message_id: session.lastResponseMessageId,
+            prompt,
+            thinking_enabled: modelCfg.thinking_enabled,
+            search_enabled: modelCfg.search_enabled,
+        }),
+    });
+    if (resp.status !== 200) return null;
+    return resp;
 }
 
 // === Vision Model Support: File Upload ===
@@ -578,20 +749,14 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', re
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
         console.log(`${agentTag} 会话 ${session.id} 已达 ${session.messageCount} 条消息，自动重置`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetWebSession(session);
         // History preserved for context injection
     }
 
     // Reset expired sessions (DeepSeek web sessions last ~1-2 hours)
     if (session.id && session.createdAt && (Date.now() - session.createdAt > SESSION_TTL_MS)) {
         console.log(`${agentTag} 会话 ${session.id} 已过期（时长: ${Math.round((Date.now() - session.createdAt) / 60000)}分钟），正在创建新会话...`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetWebSession(session);
     }
 
     const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
@@ -660,10 +825,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', re
         console.log(`${agentTag} 会话错误 (${resp.status}): ${errText.substring(0, 100)}`);
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} 会话 ${session.id} 已过期，正在创建新会话...`);
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
+            resetWebSession(session);
 
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: dsHeaders, body: '{}'
@@ -726,13 +888,14 @@ function formatToolDefinitions(tools) {
     text += '</tool_call>\n';
     text += '\n';
     text += '## RULES (MUST FOLLOW):\n';
-    text += '1. When you need data, output ONLY the tool request — NO explanations, NO thinking, NO extra text\n';
-    text += '2. Do NOT simulate, guess, or fabricate command output — wait for the actual result\n';
-    text += '3. The tool runs on ' + SERVER_HOST + ' (' + SERVER_PUBLIC_IP + '), the local server — NOT on DeepSeek\n';
-    text += '4. After the tool executes, the result will be sent to you as a new user/tool message\n';
-    text += '5. Keep arguments compact. Do not include large file contents unless the tool schema requires it.\n';
-    text += '6. If you need to call multiple tools, call them ONE AT A TIME — wait for each result before the next call\n';
-    text += '7. NEVER wrap tool calls in markdown code blocks or other formatting\n';
+    text += '1. CRITICAL: Call ONLY ONE tool at a time. Never output more than one tool call in a single response.\n';
+    text += '2. When you need data, output ONLY the tool request — NO explanations, NO thinking, NO extra text before or after.\n';
+    text += '3. Do NOT simulate, guess, or fabricate command output — wait for the actual result.\n';
+    text += '4. The tool runs on ' + SERVER_HOST + ' (' + SERVER_PUBLIC_IP + '), the local server — NOT on DeepSeek.\n';
+    text += '5. After the tool executes, the result will be sent to you as a new user/tool message.\n';
+    text += '6. Keep arguments compact and minimal. Do not include large file contents.\n';
+    text += '7. NEVER wrap tool calls in markdown code blocks or any other formatting.\n';
+    text += '8. Use ONLY the exact JSON format shown above. Any deviation will cause the tool to fail.\n';
     text += '\n';
     text += '## Available Functions:\n';
     for (const tool of tools) {
@@ -899,6 +1062,15 @@ function parseToolCall(text) {
 
     console.log(`[parseToolCall] 未匹配到工具调用（${text.length} 字符）`);
     return null;
+}
+
+function detectMultipleToolCalls(text) {
+    if (!text || typeof text !== 'string') return false;
+    const toolCallMatches = (text.match(/TOOL_CALL:\s*\w/gi) || []).length;
+    const jsonToolMatches = (text.match(/\{"tool_call":/gi) || []).length;
+    const xmlToolMatches = (text.match(/<tool_call[^>]*>/gi) || []).length;
+    const invokeMatches = (text.match(/<invoke\s+name\s*=/gi) || []).length;
+    return (toolCallMatches + jsonToolMatches + xmlToolMatches + invokeMatches) > 1;
 }
 
 /**
@@ -1389,6 +1561,21 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
+    const proxyAuthConfig = proxyKeyStore.getConfig();
+    const proxyAuthRequired = proxyDefaults.proxyRequireAuth || proxyAuthConfig.enabled;
+    const isApiEndpoint = req.method === 'POST' &&
+        ['/v1/chat/completions', '/v1/messages', '/v1/responses'].includes(url.pathname);
+    if (proxyAuthRequired && isApiEndpoint) {
+        const authMw = new AuthMiddleware({
+            enabled: true,
+            apiKeys: proxyAuthConfig.apiKeys,
+            bearerTokens: proxyAuthConfig.bearerTokens,
+            ipWhitelist: proxyAuthConfig.ipWhitelist,
+        });
+        authMw.authenticate(req, res, () => {});
+        if (res.headersSent) return;
+    }
+
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1410,6 +1597,34 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Account management
+    if (req.method === 'GET' && url.pathname === '/admin/accounts') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(accounts.map(accountStatus)));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/accounts/reload') {
+        loadDeepSeekConfig({ fatal: false });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ reloaded: true, count: accounts.length }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/admin/accounts/') && url.pathname.endsWith('/toggle')) {
+        const accId = url.pathname.split('/')[3];
+        const acc = accounts.find(a => a.id === accId);
+        if (acc) {
+            acc.enabled = !(acc.enabled !== false);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ id: acc.id, enabled: acc.enabled !== false }));
+        } else {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Account not found' }));
+        }
+        return;
+    }
+
     // Sessions status
     if (req.method === 'GET' && url.pathname === '/v1/sessions') {
         const agentList = [];
@@ -1421,6 +1636,9 @@ const server = http.createServer(async (req, res) => {
                 account: session.accountId,
                 history_size: session.history.length,
                 age_min: session.createdAt ? Math.round((Date.now() - session.createdAt) / 60000) : 0,
+                bootstrap_injected: session.bootstrapInjected || false,
+                last_response_message_id: session.lastResponseMessageId || null,
+                last_finish_reason: session.lastFinishReason || null,
             });
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1446,12 +1664,67 @@ const server = http.createServer(async (req, res) => {
         }
         const historyCount = session.history.length;
         const historyPreview = session.history.map(e => e.user.substring(0, 40)).join(' | ');
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetWebSession(session);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
+        return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/admin/proxy-auth') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(proxyKeyStore.getConfig()));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/proxy-auth/enable') {
+        proxyKeyStore.setEnabled(true);
+        proxyKeyStore.save();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ enabled: true }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/proxy-auth/disable') {
+        proxyKeyStore.setEnabled(false);
+        proxyKeyStore.save();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ enabled: false }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/proxy-auth/generate-api-key') {
+        const key = proxyKeyStore.generateApiKey();
+        proxyKeyStore.addApiKey(key);
+        proxyKeyStore.save();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ apiKey: key }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/proxy-auth/generate-bearer-token') {
+        const token = proxyKeyStore.generateBearerToken();
+        proxyKeyStore.addBearerToken(token);
+        proxyKeyStore.save();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ bearerToken: token }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/proxy-auth/remove-api-key') {
+        const body = await new Promise(r => { let d = ''; req.on('data', c => d += c); req.on('end', () => r(d)); });
+        const { apiKey } = JSON.parse(body || '{}');
+        if (apiKey) { proxyKeyStore.removeApiKey(apiKey); proxyKeyStore.save(); }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ removed: !!apiKey }));
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/admin/proxy-auth/remove-bearer-token') {
+        const body = await new Promise(r => { let d = ''; req.on('data', c => d += c); req.on('end', () => r(d)); });
+        const { bearerToken } = JSON.parse(body || '{}');
+        if (bearerToken) { proxyKeyStore.removeBearerToken(bearerToken); proxyKeyStore.save(); }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ removed: !!bearerToken }));
         return;
     }
 
@@ -1510,6 +1783,8 @@ const server = http.createServer(async (req, res) => {
             } else if (bodyInjection) {
                 promptInjection = bodyInjection;
                 console.log(`${agentTag} 提示词注入来自请求体（${bodyInjection.length} 字符）`);
+            } else if (DEFAULT_INJECTION_PROMPT && tools && tools.length > 0) {
+                promptInjection = DEFAULT_INJECTION_PROMPT;
             }
 
             const { prompt, systemPrompt } = formatMessages(messages, tools, promptInjection);
@@ -1583,6 +1858,8 @@ const server = http.createServer(async (req, res) => {
                     // Non-fatal: proceed even if image insertion fails
                 }
             }
+
+            await performBootstrapInjection(session, agentId, requestedModel, agentTag);
 
             const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel, []);
 
@@ -1658,11 +1935,17 @@ const server = http.createServer(async (req, res) => {
                                 if (lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
                                     fullContent += d.v;
                                 }
+                                if (lastPath === 'response/thinking_content' && d.v !== undefined && typeof d.v !== 'object') {
+                                    reasoningContent += d.v;
+                                }
                                 if (lastPath === 'response/finish_reason' && d.v !== undefined) {
                                     finishReason = d.v;
                                 }
                                 if (lastPath === 'response/status' && d.v !== undefined && d.v !== 'FINISHED') {
                                     finishReason = d.v;
+                                }
+                                if (lastPath === 'response/quasi_status' && d.v !== undefined) {
+                                    finishReason = finishReason || d.v;
                                 }
                             } catch (e) { }
                         }
@@ -1671,9 +1954,14 @@ const server = http.createServer(async (req, res) => {
 
                 if (newMessageId) {
                     session.parentMessageId = newMessageId;
+                    session.lastResponseMessageId = newMessageId;
                     session.messageCount++;
                 } else {
                     console.log(`${agentTag} 警告: 无法提取 message_id`);
+                }
+
+                if (finishReason) {
+                    session.lastFinishReason = finishReason;
                 }
 
                 return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError };
@@ -1713,10 +2001,7 @@ const server = http.createServer(async (req, res) => {
                     return;
                 }
                 console.log(`${agentTag} 空响应（消息#${session.messageCount}，重试 ${retryAttempt}/${MAX_RETRIES}），重置会话...`);
-                session.id = null;
-                session.parentMessageId = null;
-                session.createdAt = null;
-                session.messageCount = 0;
+                resetWebSession(session);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
                 const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
@@ -1730,20 +2015,24 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            // Auto-continuation: if finish_reason is 'length' or content is very long (>25000 chars),
-            // send a continuation request to get the rest of the response
+            // Auto-continuation: use real /api/v0/chat/continue when response is incomplete
             let continuationRounds = 0;
             const MAX_CONTINUATION = 2;
             while ((finishReason === 'length' || fullContent.length > 25000) && continuationRounds < MAX_CONTINUATION) {
                 continuationRounds++;
-                console.log(`${agentTag} 响应 ${fullContent.length} 字符（结束原因=${finishReason}），自动续写（${continuationRounds}/${MAX_CONTINUATION}）...`);
+                console.log(`${agentTag} 响应 ${fullContent.length} 字符（结束原因=${finishReason}），真实 continue（${continuationRounds}/${MAX_CONTINUATION}）...`);
                 await new Promise(r => setTimeout(r, 500));
-                const contBeforeId = session.accountId;
-                const { resp: contResp, account: contAccount } = await askDeepSeekStream('continue', agentId, requestedModel);
-                // If rotation moved us to a different account, its chat_session has no
-                // prior context — "continue" would return irrelevant text. Abort (#20).
-                if (contAccount && contBeforeId && contAccount.id !== contBeforeId) {
-                    console.log(`${agentTag} 续写时账号轮换到 ${contAccount.id} ≠ ${contBeforeId}，跳过（非本会话）`);
+                const contAccount = selectAccountForSession(session);
+                const contResp = await callDeepSeekContinue(session, contAccount, agentTag);
+                if (!contResp) {
+                    console.log(`${agentTag} continue 调用失败，回退到模拟续写`);
+                    const { resp: fallbackResp } = await askDeepSeekStream('continue', agentId, requestedModel);
+                    const fallbackResult = await readDeepSeekResponse(fallbackResp.body);
+                    const fbContent = fallbackResult && fallbackResult.content ? sanitizeContent(fallbackResult.content) : '';
+                    if (fbContent && fbContent.trim().length > 0) {
+                        fullContent += '\n' + fbContent;
+                        finishReason = fallbackResult.finishReason;
+                    }
                     break;
                 }
                 const contResult = await readDeepSeekResponse(contResp.body);
@@ -1761,14 +2050,14 @@ const server = http.createServer(async (req, res) => {
             }
 
             let toolCall = parseToolCall(fullContent);
+            if (toolCall && detectMultipleToolCalls(fullContent)) {
+                console.log(`${agentTag} 检测到多个工具调用，仅使用第一个: ${toolCall.name}`);
+            }
             
             // Retry if TOOL_CALL was found but JSON was truncated/invalid
             if (!toolCall && /TOOL_CALL:\s*\w/i.test(fullContent)) {
                 console.log(`${agentTag} 检测到 TOOL_CALL 但 JSON 无效/截断（${fullContent.length} 字符），使用更严格的提示词重试...`);
-                session.id = null;
-                session.parentMessageId = null;
-                session.createdAt = null;
-                session.messageCount = 0;
+                resetWebSession(session);
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = fullPrompt + '\n\n[STRICT INSTRUCTION] Your previous response had a TOOL_CALL but the arguments were too long and got cut off. Keep the arguments SHORT — no large file contents. Just use a minimal example or reference the file by name. Output ONLY: TOOL_CALL: <function>\narguments: <short JSON>';
                 const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
@@ -1841,13 +2130,14 @@ async function runAuthScript() {
 }
 
 function printStatus() {
+    const paConfig = proxyKeyStore.getConfig();
     console.log(`\n${formatWatermark()}`);
     console.log(`认证状态: ${hasAuthConfig() ? '✅ 已配置' : '❌ 未找到 deepseek-auth.json'}`);
     console.log(`认证文件: ${process.env.DEEPSEEK_AUTH_DIR || DS_CONFIG_PATH}`);
     console.log(`账号: ${accounts.length ? accounts.map(a => `${a.id}${a.cooldownUntil > Date.now() ? ' (冷却中)' : ''}`).join(', ') : '无'}`);
+    console.log(`代理鉴权: ${paConfig.enabled ? '🔒 已启用' : '🔓 未启用'}（API Keys: ${paConfig.apiKeys.length}, Bearer: ${paConfig.bearerTokens.length}）`);
+    console.log(`注入提示词: ${BOOTSTRAP_INJECTION_ENABLED ? '✅' : '❌'}（${DEFAULT_INJECTION_PROMPT.length} 字符）`);
     console.log(`可用模型: ${SUPPORTED_MODEL_IDS.join(', ')}`);
-    console.log('不可用/隐藏的别名: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
-    console.log('能力查询: GET /v1/model-capabilities');
 }
 
 async function showStartupMenu() {
@@ -1861,7 +2151,7 @@ async function showStartupMenu() {
         console.log(`ForgetMeAI: ${FORGETMEAI_WATERMARK}`);
         console.log('1 - 授权 / 更新 DeepSeek 登录');
         console.log('2 - 导入认证文件 / cookies');
-        console.log('3 - 显示模型和状态');
+        console.log('3 - 代理鉴权管理');
         console.log('4 - 启动代理（默认）');
         console.log('5 - 退出');
         let choice = await prompt('请选择（回车 = 4）: ');
@@ -1872,7 +2162,14 @@ async function showStartupMenu() {
             spawnSync(process.execPath, [path.join(__dirname, 'scripts', 'auth_import.js')], { stdio: 'inherit', env: process.env });
             loadDeepSeekConfig({ fatal: false });
         } else if (choice === '3') {
-            console.log(JSON.stringify(ALL_MODEL_CAPABILITIES, null, 2));
+            console.log('\n代理鉴权配置:');
+            const pa = proxyKeyStore.getConfig();
+            console.log(JSON.stringify(pa, null, 2));
+            const sub = await prompt('\n启用/禁用 (e/d)，生成 Key (k)，生成 Token (t)，返回 (回车): ');
+            if (sub === 'e') { proxyKeyStore.setEnabled(true); proxyKeyStore.save(); console.log('已启用'); }
+            else if (sub === 'd') { proxyKeyStore.setEnabled(false); proxyKeyStore.save(); console.log('已禁用'); }
+            else if (sub === 'k') { const k = proxyKeyStore.generateApiKey(); proxyKeyStore.addApiKey(k); proxyKeyStore.save(); console.log(`新 API Key: ${k}`); }
+            else if (sub === 't') { const t = proxyKeyStore.generateBearerToken(); proxyKeyStore.addBearerToken(t); proxyKeyStore.save(); console.log(`新 Bearer Token: ${t}`); }
             await prompt('\n按 Enter 返回菜单...');
         } else if (choice === '4') {
             if (!hasAuthConfig()) {
@@ -1915,5 +2212,8 @@ module.exports = {
         isDeepSeekModelErrorEvent,
         rebuildFragmentText,
         applyResponsePatchOperations,
+        parseToolCall,
+        shouldBootstrapSession,
+        buildContinuePayload,
     },
 };

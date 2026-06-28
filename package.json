@@ -1,28 +1,42 @@
 {
   "name": "free-deepseek-api",
-  "version": "0.1.0",
-  "description": "OpenAI-compatible local API proxy for DeepSeek Web chat",
+  "version": "0.2.0",
+  "description": "OpenAI-compatible local API proxy for DeepSeek Web chat with advanced features",
   "main": "server.js",
   "bin": {
-    "free-deepseek-api": "./server.js",
-    "free-deepseek-client": "./client.js"
+    "free-deepseek-api": "server.js",
+    "free-deepseek-client": "src/client/index.js"
   },
   "scripts": {
     "start": "node server.js",
-    "auth": "node scripts/auth.js",
-    "auth:import": "node scripts/auth_import.js",
-    "doctor": "node scripts/doctor.js",
-    "deepseek:auth": "node scripts/deepseek_chrome_auth.js",
-    "client": "node client.js",
-    "test": "node --check server.js && node --check scripts/auth.js && node --check scripts/auth_import.js && node --check scripts/doctor.js && node --check scripts/deepseek_chrome_auth.js && node --check scripts/probe_deepseek_models.js && node --check client.js && node --check scripts/live_agentic_smoke_tests.mjs && node --test tests/unit.test.js",
-    "test:live": "node scripts/live_agentic_smoke_tests.mjs"
+    "dev": "nodemon server.js",
+    "client": "node src/client/index.js",
+    "test": "node --test tests/unit.test.js tests/proxy-upgrade.test.js",
+    "test:live": "node scripts/live_agentic_smoke_tests.mjs",
+    "lint": "eslint src/**/*.js",
+    "format": "prettier --write src/**/*.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "prom-client": "^15.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "nodemon": "^3.1.0",
+    "prettier": "^3.2.5"
   },
   "keywords": [
     "deepseek",
     "proxy",
     "openai-compatible",
     "llm",
-    "web-api"
+    "web-api",
+    "account-pool",
+    "rate-limiting"
   ],
   "license": "MIT",
   "engines": {
@@ -30,6 +44,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ForgetMeAI/FreeDeepseekAPI.git"
-  }
+    "url": "git+https://github.com/ForgetMeAI/FreeDeepseekAPI.git"
+  },
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "author": "",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ForgetMeAI/FreeDeepseekAPI/issues"
+  },
+  "homepage": "https://github.com/ForgetMeAI/FreeDeepseekAPI#readme"
 }

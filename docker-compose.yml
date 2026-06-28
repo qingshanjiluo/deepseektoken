@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  free-deepseek-api:
+    build: .
+    container_name: free-deepseek-api
+    restart: unless-stopped
+    ports:
+      - "9655:9655"
+    environment:
+      - PORT=9655
+      - HOST=0.0.0.0
+      - DEEPSEEK_AUTH_PATH=/app/config/deepseek-auth.json
+      - DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:9655/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - deepseek-network
+
+networks:
+  deepseek-network:
+    driver: bridge

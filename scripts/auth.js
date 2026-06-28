@@ -68,13 +68,32 @@ async function menu() {
     console.log('2 - 导入认证文件 / cookies');
     console.log('3 - 显示状态');
     console.log('4 - 删除本地认证文件');
-    console.log('5 - 退出');
-    const choice = (await prompt('请选择（回车 = 5）: ')) || '5';
+    console.log('5 - 代理鉴权管理');
+    console.log('6 - 退出');
+    const choice = (await prompt('请选择（回车 = 6）: ')) || '6';
     if (choice === '1') runDirectAuth();
     else if (choice === '2') runImportAuth();
     else if (choice === '3') { status(); await prompt('\n按 Enter 返回菜单...'); }
     else if (choice === '4') removeLocalAuth();
-    else if (choice === '5') break;
+    else if (choice === '5') {
+        const ROOT = path.resolve(__dirname, '..');
+        const { ProxyKeyStore } = require(path.join(ROOT, 'src', 'auth', 'proxyKeyStore'));
+        const paPath = process.env.PROXY_AUTH_PATH || path.join(ROOT, 'proxy-auth.json');
+        const pa = new ProxyKeyStore({ filePath: paPath });
+        pa.load();
+        while (true) {
+            console.log('\n代理鉴权:');
+            console.log(JSON.stringify(pa.getConfig(), null, 2));
+            console.log('e-启用, d-禁用, k-生成 API Key, t-生成 Bearer, r-返回');
+            const sub = (await prompt('操作: ')) || 'r';
+            if (sub === 'e') { pa.setEnabled(true); pa.save(); console.log('已启用'); }
+            else if (sub === 'd') { pa.setEnabled(false); pa.save(); console.log('已禁用'); }
+            else if (sub === 'k') { const k = pa.generateApiKey(); pa.addApiKey(k); pa.save(); console.log(`Key: ${k}`); }
+            else if (sub === 't') { const t = pa.generateBearerToken(); pa.addBearerToken(t); pa.save(); console.log(`Token: ${t}`); }
+            else break;
+        }
+    }
+    else if (choice === '6') break;
   }
 }
 (async () => {

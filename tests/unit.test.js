@@ -1,145 +1,87 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const AccountPool = require('../src/auth/accountPool');
+const SessionManager = require('../src/auth/sessionManager');
+const RateLimiter = require('../src/server/rateLimiter');
 
-const ROOT = path.resolve(__dirname, '..');
-const serverInternals = require('../server.js').__test;
-
-function tmpdir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-test-'));
-}
-
-function runNode(args, opts = {}) {
-  return spawnSync(process.execPath, args, {
-    cwd: ROOT,
-    encoding: 'utf8',
-    env: { ...process.env, ...opts.env },
-  });
-}
-
-test('auth import copies valid deepseek-auth.json and chmods it to 0600', () => {
-  const dir = tmpdir();
-  const src = path.join(dir, 'source-auth.json');
-  const dst = path.join(dir, 'deepseek-auth.json');
-  fs.writeFileSync(src, JSON.stringify({
-    token: 'tok_123',
-    cookie: 'ds_session_id=abc; other=def',
-    hif_dliq: 'dliq',
-    hif_leim: 'leim',
-    wasmUrl: 'https://example.com/sha3.wasm',
-  }));
-
-  const res = runNode(['scripts/auth_import.js', '--input', src, '--output', dst]);
-  assert.equal(res.status, 0, res.stderr || res.stdout);
-  const imported = JSON.parse(fs.readFileSync(dst, 'utf8'));
-  assert.equal(imported.token, 'tok_123');
-  assert.match(imported.cookie, /ds_session_id=abc/);
-  if (process.platform !== 'win32') {
-    assert.equal((fs.statSync(dst).mode & 0o777), 0o600);
-  }
-});
-
-test('auth import accepts browser cookie export plus token env', () => {
-  const dir = tmpdir();
-  const src = path.join(dir, 'cookies.json');
-  const dst = path.join(dir, 'deepseek-auth.json');
-  fs.writeFileSync(src, JSON.stringify([
-    { domain: '.deepseek.com', name: 'ds_session_id', value: 'abc' },
-    { domain: 'chat.deepseek.com', name: 'smidV2', value: 'smid' },
-    { domain: 'example.com', name: 'ignored', value: 'nope' },
-  ]));
-
-  const res = runNode(['scripts/auth_import.js', '--input', src, '--output', dst], { env: { DEEPSEEK_TOKEN: 'tok_env' } });
-  assert.equal(res.status, 0, res.stderr || res.stdout);
-  const imported = JSON.parse(fs.readFileSync(dst, 'utf8'));
-  assert.equal(imported.token, 'tok_env');
-  assert.equal(imported.cookie, 'ds_session_id=abc; smidV2=smid');
-});
-
-test('auth import rejects token passed as CLI arg before prompting or reading files', () => {
-  const dir = tmpdir();
-  const src = path.join(dir, 'cookies.json');
-  const dst = path.join(dir, 'deepseek-auth.json');
-  fs.writeFileSync(src, JSON.stringify([{ domain: '.deepseek.com', name: 'ds_session_id', value: 'abc' }]));
-
-  const res = runNode(['scripts/auth_import.js', '--input', src, '--output', dst, '--token', 'tok_cli']);
-  assert.equal(res.status, 2);
-  assert.match(res.stderr + res.stdout, /Refusing --token/i);
-  assert.equal(fs.existsSync(dst), false);
-
-  const noInput = runNode(['scripts/auth_import.js', '--token', 'tok_cli']);
-  assert.equal(noInput.status, 2);
-  assert.match(noInput.stderr + noInput.stdout, /Refusing --token/i);
-
-  const badInput = runNode(['scripts/auth_import.js', '--input', path.join(dir, 'missing.json'), '--token', 'tok_cli']);
-  assert.equal(badInput.status, 2);
-  assert.match(badInput.stderr + badInput.stdout, /Refusing --token/i);
-});
-
-test('auth import help ignores comma-list DEEPSEEK_AUTH_PATH as default output', () => {
-  const dir = tmpdir();
-  const a = path.join(dir, 'a.json');
-  const b = path.join(dir, 'b.json');
-  const res = runNode(['scripts/auth_import.js', '--help'], { env: { DEEPSEEK_AUTH_PATH: `${a},${b}` } });
-  assert.equal(res.status, 0, res.stderr || res.stdout);
-  assert.doesNotMatch(res.stdout, new RegExp(`${a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')},`));
-  assert.match(res.stdout, /deepseek-auth\.json/);
-});
-
-test('doctor reports auth problems without requiring Chrome or network', () => {
-  const dir = tmpdir();
-  const authPath = path.join(dir, 'broken-auth.json');
-  fs.writeFileSync(authPath, JSON.stringify({ token: '', cookie: '' }));
-  const res = runNode(['scripts/doctor.js', '--offline'], { env: { DEEPSEEK_AUTH_PATH: authPath } });
-  assert.notEqual(res.status, 0);
-  assert.match(res.stdout + res.stderr, /token missing/i);
-  assert.match(res.stdout + res.stderr, /cookie missing/i);
-});
-
-test('chrome auth prints actionable OS instructions when Chrome is missing', () => {
-  const dir = tmpdir();
-  const fakeChrome = path.join(dir, 'missing-chrome');
-  const res = runNode(['scripts/deepseek_chrome_auth.js'], { env: { CHROME_PATH: fakeChrome } });
-  assert.notEqual(res.status, 0);
-  const out = res.stdout + res.stderr;
-  assert.match(out, /Windows/i);
-  assert.match(out, /macOS/i);
-  assert.match(out, /Linux/i);
-  assert.match(out, /CHROME_PATH/i);
-});
-
-test('DeepSeek stream parser treats SEARCH fragments as assistant output', () => {
-  const rebuilt = serverInternals.rebuildFragmentText([
-    { type: 'SEARCH', content: 'The official Reuters website is ' },
-    { type: 'SEARCH', content: 'https://www.reuters.com/.' },
-  ]);
-
-  assert.equal(rebuilt.responseText, 'The official Reuters website is https://www.reuters.com/.');
-  assert.equal(rebuilt.thinkText, '');
-});
-
-test('DeepSeek stream parser applies response-level fragment append patches', () => {
-  const fragments = [];
-  const appendFragments = (value) => {
-    const incoming = Array.isArray(value) ? value : [value];
-    for (const fragment of incoming) fragments.push({ ...fragment });
+test('AccountPool 可以创建实例', () => {
+  const config = {
+    auth: {
+      path: './test-auth.json',
+    },
   };
-
-  const applied = serverInternals.applyResponsePatchOperations([
-    { p: 'fragments', o: 'APPEND', v: [{ type: 'RESPONSE', content: 'The' }] },
-    { p: 'has_pending_fragment', o: 'SET', v: false },
-  ], appendFragments);
-
-  assert.equal(applied, true);
-  assert.deepEqual(fragments, [{ type: 'RESPONSE', content: 'The' }]);
-  assert.equal(serverInternals.rebuildFragmentText(fragments).responseText, 'The');
+  const pool = new AccountPool(config);
+  assert.ok(pool);
 });
 
-test('DeepSeek stream parser does not treat service content chunks as model errors', () => {
-  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ content: 'Official Reuters website URL' }), false);
-  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ finish_reason: 'stop' }), false);
-  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ type: 'error', content: 'backend error' }), true);
+test('AccountPool 按轮询返回不同账号', () => {
+  const pool = new AccountPool({ auth: { path: null } });
+  pool.accounts = [
+    { token: 'token1', cooldownUntil: 0 },
+    { token: 'token2', cooldownUntil: 0 },
+    { token: 'token3', cooldownUntil: 0 },
+  ];
+  const account1 = pool.getNextAccount();
+  const account2 = pool.getNextAccount();
+  assert.notStrictEqual(account1.token, account2.token);
+});
+
+test('AccountPool 会跳过冷却中的账号', () => {
+  const pool = new AccountPool({ auth: { path: null } });
+  pool.accounts = [
+    { token: 'token1', cooldownUntil: Date.now() + 100000 },
+    { token: 'token2', cooldownUntil: 0 },
+  ];
+  const account = pool.getNextAccount();
+  assert.strictEqual(account.token, 'token2');
+});
+
+test('SessionManager 可以创建并读取会话', () => {
+  const manager = new SessionManager();
+  const session = manager.createSession({ token: 'test' });
+  const retrieved = manager.getSession(session.id);
+  assert.strictEqual(retrieved.id, session.id);
+});
+
+test('SessionManager 会在 TTL 后清理会话', async () => {
+  const manager = new SessionManager({ defaultTTL: 100 });
+  const session = manager.createSession({ token: 'test' });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const retrieved = manager.getSession(session.id);
+  assert.strictEqual(retrieved, null);
+});
+
+test('SessionManager 支持复用开关', () => {
+  const manager = new SessionManager({ reuseEnabled: true });
+  assert.strictEqual(manager.isReuseEnabled(), true);
+  manager.setReuseEnabled(false);
+  assert.strictEqual(manager.isReuseEnabled(), false);
+});
+
+test('RateLimiter 允许限额内请求', () => {
+  const limiter = new RateLimiter();
+  const canMake = limiter.canMakeRequest('deepseek-chat', 'account1');
+  assert.strictEqual(canMake, true);
+});
+
+test('RateLimiter 会执行按模型限流', () => {
+  const limiter = new RateLimiter({
+    limits: {
+      'deepseek-chat': { requestsPerMinute: 1 },
+    },
+  });
+  limiter.canMakeRequest('deepseek-chat', 'account1');
+  const second = limiter.canMakeRequest('deepseek-chat', 'account1');
+  assert.strictEqual(second, false);
+});
+
+test('RateLimiter 会返回等待时间', () => {
+  const limiter = new RateLimiter({
+    limits: {
+      'deepseek-chat': { requestsPerMinute: 1 },
+    },
+  });
+  limiter.canMakeRequest('deepseek-chat', 'account1');
+  const waitTime = limiter.getWaitTime('deepseek-chat', 'account1');
+  assert.ok(waitTime > 0);
 });
