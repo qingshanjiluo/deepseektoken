@@ -5,6 +5,8 @@ auth.json
 deepseek-auth.json
 proxy-auth.json
 .wizard-lang.json
+.wizard-config.json
+.injection-prompt.txt
 .chrome-profile-deepseek/
 .chrome-for-testing-profile-deepseek/
 .chrome-for-testing-profile-deepseek.stale-*/
