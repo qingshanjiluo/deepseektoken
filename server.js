@@ -42,7 +42,20 @@ const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
 const HOST = process.env.HOST || '0.0.0.0';
 const proxyDefaults = getProxyDefaults(process.env);
-const DEFAULT_INJECTION_PROMPT = proxyDefaults.defaultInjectionPrompt;
+
+let DEFAULT_INJECTION_PROMPT = proxyDefaults.defaultInjectionPrompt;
+
+// If .injection-prompt.txt exists, use it as the default (wizard-managed)
+const WIZARD_INJECTION_FILE = path.join(__dirname, '.injection-prompt.txt');
+if (fs.existsSync(WIZARD_INJECTION_FILE)) {
+  try {
+    const wizardInj = fs.readFileSync(WIZARD_INJECTION_FILE, 'utf8').trim();
+    if (wizardInj) {
+      DEFAULT_INJECTION_PROMPT = wizardInj;
+      console.log(`[DS-API] Using wizard-managed injection prompt (${wizardInj.length} chars)`);
+    }
+  } catch (e) {}
+}
 const BOOTSTRAP_INJECTION_ENABLED = proxyDefaults.bootstrapInjectionEnabled;
 const PROXY_AUTH_PATH = proxyDefaults.proxyAuthPath;
 const PROXY_REQUIRE_AUTH = proxyDefaults.proxyRequireAuth;

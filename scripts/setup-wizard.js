@@ -7,6 +7,7 @@ const { spawnSync } = require('child_process');
 const ROOT = path.resolve(__dirname, '..');
 const LANGS = require(path.join(ROOT, 'src', 'config', 'i18n'));
 const WI18N = require(path.join(ROOT, 'src', 'config', 'i18n-wizard'));
+const { INJECTION_PRESETS } = require(path.join(ROOT, 'src', 'config', 'proxy-defaults'));
 const C = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m', cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m', blue: '\x1b[34m', magenta: '\x1b[35m', white: '\x1b[37m' };
 
 const LANG_NAMES = { zh: '\u4e2d\u6587', en: 'English', ru: '\u0420\u0443\u0441\u0441\u043a\u0438\u0439', ja: '\u65e5\u672c\u8a9e', ko: '\ud55c\uad6d\uc5b4' };
@@ -256,34 +257,88 @@ async function main() {
 
   // ============== SECTION: PROXY AUTH ==============
   if(runProxy){
-    hdr(0,wt('stepProxy'),(pa&&pa.enabled)?C.green+wt('welcomeCardProxyOn',{keys:(pa.apiKeys||[]).length,bearers:(pa.bearerTokens||[]).length})+C.reset:null);
+    const proxyLabel = (paena,keys,bears) => paena ? C.green + wt('welcomeCardProxyOn', {keys,bears}) + C.reset : C.yellow + wt('welcomeCardProxyOff') + C.reset;
     try{pa=require(paFile);}catch{pa=null;}
-    if(pa&&pa.enabled){
-      ok(t('proxyAuthEnabled'));info(t('proxyApiKeys',{keys:(pa.apiKeys||[]).length,bearers:(pa.bearerTokens||[]).length}));
-      if(await askYesNo(t('proxyRegen'),true)){
-        const{ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
-        const s=new ProxyKeyStore({filePath:paFile});s.load();s.setEnabled(true);
-        const ak=s.generateApiKey();s.addApiKey(ak);const bt=s.generateBearerToken();s.addBearerToken(bt);s.save();
-        ok(t('proxyGeneratedOk'));divider('\u2500',48);
-        console.log(`\n  ${C.bold}${t('credentialsSave')}${C.reset}\n`);
-        console.log(`  ${C.green}${t('xApiKeyHeader')}${C.reset}\n  ${C.yellow}${ak}${C.reset}\n`);
-        console.log(`  ${C.green}${t('authHeader')}${C.reset}\n  ${C.yellow}Bearer ${bt}${C.reset}\n`);
-        console.log(`  ${C.dim}${t('credentialsExample')}${C.reset}`);
-        console.log(`  ${C.dim}curl -H "x-api-key: ${ak}" http://localhost:9655/v1/chat/completions${C.reset}`);
-        divider('\u2500',48);
-      }
-    }else{
-      console.log(`  ${C.dim}${t('proxyDisabled')}${C.reset}`);
-      console.log(`  ${C.dim}${t('proxyEnableHint')}${C.reset}`);
-      if(await askYesNo(t('proxyEnable'),true)){
-        const{ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
-        const s=new ProxyKeyStore({filePath:paFile});s.load();s.setEnabled(true);
-        const ak=s.generateApiKey();s.addApiKey(ak);const bt=s.generateBearerToken();s.addBearerToken(bt);s.save();
-        ok(t('proxyGeneratedOk'));divider('\u2500',48);
-        console.log(`\n  ${C.bold}${t('credentialsSave')}${C.reset}\n`);
-        console.log(`  ${C.green}${t('xApiKeyHeader')}${C.reset}\n  ${C.yellow}${ak}${C.reset}\n`);
-        console.log(`  ${C.green}${t('authHeader')}${C.reset}\n  ${C.yellow}Bearer ${bt}${C.reset}\n`);
-        divider('\u2500',48);
+    const initialEnabled = pa && pa.enabled;
+
+    while(true){
+      try{pa=require(paFile);}catch{pa=null;}
+      const paEnabled = pa && pa.enabled;
+      const paKeys = (pa && pa.apiKeys) || [];
+      const paTokens = (pa && pa.bearerTokens) || [];
+      hdr(0, wt('stepProxy'), proxyLabel(paEnabled,paKeys.length,paTokens.length));
+      console.log();
+
+      if(paEnabled){
+        if(paKeys.length>0){ console.log(`  ${C.dim}${wt('proxyKeyList')}${C.reset}`); for(let i=0;i<paKeys.length;i++) console.log(`    ${i+1}. ${C.yellow}${paKeys[i]}${C.reset}`); console.log(); }
+        if(paTokens.length>0){ console.log(`  ${C.dim}${wt('proxyTokenList')}${C.reset}`); for(let i=0;i<paTokens.length;i++) console.log(`    ${i+1}. ${C.yellow}${paTokens[i]}${C.reset}`); console.log(); }
+        ok(t('proxyAuthEnabled'));
+        const paOpts=[wt('proxyAddKey'),wt('proxyAddToken')];
+        if(paKeys.length>0)paOpts.unshift(wt('proxyRemoveKey'));
+        if(paTokens.length>0)paOpts.push(wt('proxyRemoveToken'));
+        paOpts.push(wt('proxyDisable'));
+        paOpts.push(wt('sectionSkip'));
+        const paM=await askChoice('',paOpts);
+        const {ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
+        const s=new ProxyKeyStore({filePath:paFile});s.load();
+        if(paOpts.indexOf(wt('proxyRemoveKey'))===0&&paM===1){
+          const rmIdx=parseInt(await ask(wt('proxyRemoveByIdx'),'0'),10);
+          if(rmIdx>=1&&rmIdx<=paKeys.length){s.removeApiKey(paKeys[rmIdx-1]);s.save();ok(`${wt('proxyRemoveSelect')} #${rmIdx}`);}
+        }else if((paOpts.indexOf(wt('proxyAddKey'))===0||paOpts.indexOf(wt('proxyAddKey'))===1)&&paM===paOpts.indexOf(wt('proxyAddKey'))+1){
+          const ak=s.generateApiKey();s.addApiKey(ak);s.save();ok(wt('proxyAddKey'));console.log(`\n  ${C.yellow}${ak}${C.reset}\n`);
+        }else if(paM===paOpts.indexOf(wt('proxyAddToken'))+1){
+          const bt=s.generateBearerToken();s.addBearerToken(bt);s.save();ok(wt('proxyAddToken'));console.log(`\n  ${C.yellow}${bt}${C.reset}\n`);
+        }else if(paM===paOpts.indexOf(wt('proxyRemoveToken'))+1){
+          const rmIdx=parseInt(await ask(wt('proxyRemoveByIdx'),'0'),10);
+          if(rmIdx>=1&&rmIdx<=paTokens.length){s.removeBearerToken(paTokens[rmIdx-1]);s.save();ok(`${wt('proxyRemoveSelect')} #${rmIdx}`);}
+        }else if(paM===paOpts.indexOf(wt('proxyDisable'))+1){
+          if(await askYesNo('',true)){s.setEnabled(false);s.save();ok(wt('proxyDisabledNow'));}
+        }else{break;}
+      }else{
+        warn(t('proxyDisabled'));
+        if(!initialEnabled){
+          const enableChoice=await askChoice('',[wt('proxyEnableTitle'),wt('proxyAddKey')+' + '+wt('proxyAddToken'),wt('sectionSkip')]);
+          if(enableChoice===1){
+            try{pa=require(paFile);}catch{pa=null;}
+            const exKeys=(pa&&pa.apiKeys)||[];const exTokens=(pa&&pa.bearerTokens)||[];
+            if(exKeys.length>0||exTokens.length>0){
+              if(await askYesNo('',false)){
+                const {ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
+                const s=new ProxyKeyStore({filePath:paFile});s.load();s.setEnabled(true);s.save();
+                ok(`${wt('proxyEnableTitle')} (${exKeys.length} keys, ${exTokens.length} tokens)`);
+              }
+            }else{
+              const {ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
+              const s=new ProxyKeyStore({filePath:paFile});s.load();s.setEnabled(true);
+              const ak=s.generateApiKey();s.addApiKey(ak);const bt=s.generateBearerToken();s.addBearerToken(bt);s.save();
+              ok(t('proxyGeneratedOk'));divider('\u2500',48);
+              console.log(`\n  ${C.bold}${t('credentialsSave')}${C.reset}\n`);
+              console.log(`  ${C.green}${t('xApiKeyHeader')}${C.reset}\n  ${C.yellow}${ak}${C.reset}\n`);
+              console.log(`  ${C.green}${t('authHeader')}${C.reset}\n  ${C.yellow}Bearer ${bt}${C.reset}\n`);
+              divider('\u2500',48);
+            }
+          }else if(enableChoice===2){
+            const {ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
+            const s=new ProxyKeyStore({filePath:paFile});s.load();s.setEnabled(true);
+            const ak=s.generateApiKey();s.addApiKey(ak);const bt=s.generateBearerToken();s.addBearerToken(bt);s.save();
+            ok(t('proxyGeneratedOk'));divider('\u2500',48);
+            console.log(`\n  ${C.bold}${t('credentialsSave')}${C.reset}\n`);
+            console.log(`  ${C.green}${t('xApiKeyHeader')}${C.reset}\n  ${C.yellow}${ak}${C.reset}\n`);
+            console.log(`  ${C.green}${t('authHeader')}${C.reset}\n  ${C.yellow}Bearer ${bt}${C.reset}\n`);
+            divider('\u2500',48);
+          }else{break;}
+        }else{
+          // Was enabled, user disabled it - offer to re-enable or keep off
+          try{pa=require(paFile);}catch{pa=null;}
+          const exKeys=(pa&&pa.apiKeys)||[];const exTokens=(pa&&pa.bearerTokens)||[];
+          const reenableChoice=await askChoice('',[wt('proxyEnableTitle'),wt('proxyKeepDisabled')]);
+          if(reenableChoice===1){
+            const {ProxyKeyStore}=require(path.join(ROOT,'src','auth','proxyKeyStore'));
+            const s=new ProxyKeyStore({filePath:paFile});s.load();s.setEnabled(true);s.save();
+            ok(wt('welcomeCardProxyOn',{keys:exKeys.length,bearers:exTokens.length}));
+          }
+          break;
+        }
       }
     }
   }
@@ -298,19 +353,35 @@ async function main() {
     if(curEnabled&&curInj){
       console.log(`\n  ${C.dim}${wt('injectPreview',{chars:curInj.length})}${C.reset}\n  ${C.white}${curInj.length>200?curInj.substring(0,200)+'...':curInj}${C.reset}`);
     }
-    if(await askYesNo(wt('injectEdit'),false)){
+
+    // ---- preset selection ----
+    console.log();
+    const presetChoice=await askChoice(wt('injectPresets'),[
+      wt('injectPresetTool'),
+      wt('injectPresetStrict'),
+      wt('injectPresetSimple'),
+      wt('injectPresetCreative'),
+      wt('injectPresetCustom'),
+    ]);
+    if(presetChoice===1){
+      saveInjectionPrompt(INJECTION_PRESETS.tool);ok(wt('injectSaved'));
+    }else if(presetChoice===2){
+      saveInjectionPrompt(INJECTION_PRESETS.strict);ok(wt('injectSaved'));
+    }else if(presetChoice===3){
+      saveInjectionPrompt(INJECTION_PRESETS.simple);ok(wt('injectSaved'));
+    }else if(presetChoice===4){
+      saveInjectionPrompt(INJECTION_PRESETS.creative);ok(wt('injectSaved'));
+    }else if(presetChoice===5){
       const newInj=await ask(wt('injectEnter'));
-      if(newInj){
-        saveInjectionPrompt(newInj);
-        ok(wt('injectSaved'));
-        ok(wt('injectStoreFile',{file:INJECTION_FILE}));
-      }
+      if(newInj){saveInjectionPrompt(newInj);ok(wt('injectSaved'));}
     }
+
     if(!curEnabled){
       if(await askYesNo(wt('injectEnable'),false)){
         process.env.DEEPSEEK_BOOTSTRAP_INJECTION_ENABLED='1';
-        if(!getInjectionPrompt()&&curInj)saveInjectionPrompt(curInj);
-        ok(wt('welcomeCardInjectOn',{chars:(getInjectionPrompt()||curInj||'').length}));
+        const saved=getInjectionPrompt();
+        if(!saved&&curInj)saveInjectionPrompt(curInj);
+        ok(wt('welcomeCardInjectOn',{chars:(saved||curInj||'').length}));
       }
     }else{
       if(await askYesNo(t('disableBootstrap'),true)){
